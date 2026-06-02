@@ -1,0 +1,12 @@
+# Node dependencies
+backend/node_modules/
+node_modules/
+
+# Database data
+backend/qdrant_data/
+
+# Python Virtual Environment
+venv/
+
+# Environment variables
+.env
