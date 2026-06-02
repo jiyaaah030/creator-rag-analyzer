@@ -27,7 +27,8 @@ def get_youtube_data(url: str):
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
-            "extract_flat": False # We need the full metadata payload
+            "extract_flat": False, # We need the full metadata payload
+            "cookiefile": "youtube_cookies.txt"  # <--- ADD THIS LINE
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
