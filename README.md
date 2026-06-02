@@ -1,75 +1,96 @@
-# Creator RAG Analyzer (Internal Architecture & Trade-offs)
+# Creator RAG Analyzer: Production Architecture & Trade-offs
 
-A localized multimodal RAG pipeline built over a weekend to ingest, parse, and semantically query cross-platform creator content (YouTube transcripts + Instagram Reels metadata).
+This repository contains the full-stack engineering prototype for a multimodal RAG pipeline built to ingest cross-platform creator data (YouTube transcripts and Instagram Reels metrics) and expose them through a low-latency, streaming AI chat interface.
 
-The goal was simple: get a low-latency, streaming engineering prototype up and running without burning API credits on third-party model providers for structural tasks like text embeddings.
+The goal wasn't just to write an LLM wrapper, but to solve the actual infrastructure, memory, and scraping hurdles that occur when moving decoupled Python and Next.js applications into a cloud environment.
 
-## The Architecture Stack
+## Technical Stack & Topology
 
-- **Frontend:** Next.js 15 (App Router, Turbopack) using native `ReadableStream` for chunked rendering.
-- **Backend:** FastAPI (Uvicorn ASGI) handling stream generation.
-- **Embeddings Engine:** Local HuggingFace `all-MiniLM-L6-v2` via `langchain-huggingface`.
-- **Vector Layer:** Qdrant (Disk-persisted local storage).
-- **Inference Layer:** Groq Engine (`llama-3.1-8b-instant`).
+- **Frontend:** Next.js 15 (App Router, Turbopack) using the native `ReadableStream` API to process chunked tokens over raw JSON responses. Hosted on Vercel.
+- **Backend:** FastAPI (Uvicorn ASGI) handling cross-origin streams and coordination. Hosted on Render.
+- **Vector Store:** Qdrant Cloud (Managed Cluster) via the `qdrant-client` SDK.
+- **Embeddings:** HuggingFace Inference API (`sentence-transformers/all-MiniLM-L6-v2`) via LangChain.
+- **LLM Core:** Groq API running `llama-3.1-8b-instant` for sub-second streaming inference.
 
-## Architectural Decisions & Trade-offs
+## Production Battle Scars: Hard Engineering Decisions
 
-### 1. Why Qdrant over ChromaDB or FAISS?
+### 1. The 512MB RAM Crash (Local vs. Cloud Embeddings)
 
-I chose Qdrant because of its native support for payload filtering and its underlying Rust implementation. In a cross-platform creator analysis tool, queries are rarely purely semantic. Users ask questions restricted to specific platforms (e.g., "Compare _only_ my Instagram engagement metrics"). Qdrant allows us to apply metadata filters directly to the vector payload before running the HNSW vector search, avoiding semantic dilution.
+During local testing, I utilized a local instance of `langchain-huggingface` running PyTorch to generate vector embeddings. It worked flawlessly on my machine. However, when deploying to Render's free tier, the container instantly suffered `OOM (Out of Memory)` fatal crashes during startup because loading PyTorch and the model weights exceeded the strict 512MB RAM ceiling.
 
-**The Local File-Lock Scar:** During development on Windows with Uvicorn’s `--reload` process monitor, global module instantiation of the Qdrant client caused multi-process file deadlocks (`portalocker.exceptions.AlreadyLocked`). I refactored the vector layer to use a lazy-loaded singleton pattern (`get_qdrant_client()`), ensuring the database disk lock is only claimed inside execution threads rather than on module import.
+- **The Decision:** Instead of asking for a paid upgrade, I refactored the entire embedding pipeline. I removed PyTorch and heavy deep-learning dependencies entirely from `requirements.txt`, dropping the deployment image size from over 1.5GB to under 100MB. I swapped the architecture to offload embedding generation to the asynchronous **HuggingFace Inference API**. This kept the pipeline lightweight, completely free, and computationally efficient.
 
-### 2. Why Chunk Size 500 with 100 Overlap?
+### 2. Bypassing the Data-Center IP Block
 
-Video transcripts are not structured prose—they lack natural paragraph breaks, punctuation, and markdown semantics. They are continuous streams of spoken dialogue.
+Once deployed on Render, the YouTube ingestion route immediately broke with `403 Sign in to confirm you’re not a bot` errors. This happened because `yt-dlp` requests were originating from data-center IP blocks flagged by YouTube’s automated scraping defense systems.
 
-- **500 Character Chunk Size:** This equates to roughly 20 to 30 seconds of real-time speech. Keeping chunks this tight ensures that specific metrics or conversational hooks aren't watered down by minutes of unrelated talking points inside the embedding space.
-- **100 Character Overlap:** Essential for preventing structural truncation. Since scripts are parsed raw, a 100-character safety boundary guarantees that contextual phrases or numbers split across windows remain semantically retrievable.
+- **The Decision:** I modified the backend initialization sequence to look for an absolute path targeting a Netscape-formatted authentication cookie file (`youtube_cookies.txt`). Furthermore, when handling YouTube Shorts or unusual audio streams, `yt-dlp` would throw format availability exceptions. I patched the extraction configurations to enforce `ignore_no_formats_error: True` and fallback stream selection, allowing metadata harvesting to succeed smoothly.
 
-### 3. Context Injection vs Fine-Tuning
+### 3. State Management: The Cloud Vector Layer Pivot
 
-To get the LLM to understand high-level card metrics (views, likes, comments) which _do not_ exist in spoken video transcripts, I updated the chat pipeline to dynamically build a `metrics_summary` context block on the fly. This block is hard-injected straight into the system prompt alongside the semantic text blocks retrieved from Qdrant. This hybrid context model forces the LLM to ground its qualitative analysis in raw, quantitative performance numbers without needing to maintain expensive real-time fine-tuning steps.
+Initially, the vector database targeted a local persistent storage directory (`./qdrant_data`). This works well locally but is completely unviable for ephemeral cloud instances (like Render or Heroku) which completely wipe the local disk state upon container sleep cycles or new code deployments.
 
-## What Breaks at Scale? (1,000 Creators / 10,000 Users)
+- **The Decision:** I migrated the persistence layer to a **Qdrant Cloud Cluster**. I designed the connection manager around a lazy-loaded singleton structure (`get_qdrant_client()`). This keeps network connections pooled efficiently and prevents the application from making dead connections or dropping index records during backend scale-downs.
 
-If this repo hits real production load tomorrow, it will break in three distinct places. Here is the post-mortem before it happens:
+### 4. Chunk Strategy: 500 Characters / 100 Overlap
 
-### 1. The Instagram Ingestion Wall
+Video and audio transcripts lack structural punctuation, headers, and markdown boundaries. They are unformatted streams of continuous text.
 
-Right now, `yt-dlp` handles the asset parsing inside a synchronous block within our FastAPI endpoints. This works fine for single execution tests on a local machine. However, at 1,000 creators a day, Instagram will flag the deployment server’s IP and trigger aggressive rate-limiting or anti-bot blocks within minutes, resulting in empty metrics payloads.
+- **Why 500 Characters:** This length represents roughly 20 to 30 seconds of spoken dialogue. Keeping chunks small ensures that highly specific data metrics or programmatic conversational contexts do not get diluted inside the multi-dimensional vector space.
+- **Why 100 Overlap:** This acts as a buffer to preserve structural continuity. It guarantees that semantic concepts or critical analytics metrics that happen to be split directly at a 500-character boundary remain fully retrievable across adjacent windows.
 
-- _The Fix:_ Decouple the ingestion pipeline completely. Move ingestion tasks to an asynchronous task queue (Celery + Redis) and route all structural extraction requests through rotating residential proxy networks.
+## System Vulnerabilities: What Breaks at Scale?
 
-### 2. Synchronous Network I/O Deadlocks
+If this platform scale shifts tomorrow to 1,000 creators or 10,000 concurrent users, the architecture will saturate in two critical locations:
 
-Currently, when a user drops a URL, the server waits synchronously for the video metadata and transcript to download before completing the request. Under concurrent load from 10,000 users, FastAPI's event loop will saturate waiting for third-party network responses, causing massive API degradation and `504 Gateway Timeouts`.
+### 1. Synchronous Network I/O Saturation
 
-- _The Fix:_ Implement a non-blocking webhook architecture. The user submits a URL, the backend immediately returns a `202 Accepted` with a job ID, and the frontend polls or listens via WebSockets while Celery handles the extraction in the background.
+Right now, the `/ingest` route handles URL validation, metadata parsing, and vector ingestion synchronously within FastAPI's context. Under massive concurrent loads, the server event loop will saturate waiting for remote network callbacks from YouTube and Instagram, degrading API responsiveness and causing `504 Gateway Timeouts`.
 
-### 3. Ephemeral Storage Corruption
+- **The Fix:** Move to a decoupled, event-driven worker model. The ingestion route should immediately return a `202 Accepted` status with a unique job UUID, handing off the intensive asset collection to an asynchronous worker pool (Celery or RabbitMQ + Redis). The Next.js frontend can then either poll a status endpoint or listen to a WebSocket connection for ingestion updates.
 
-The current database relies on a local disk path (`./qdrant_data`). If deployed on a standard ephemeral server instance (like Render or Heroku standard dynos), the database state is completely destroyed every time the container restarts or re-deploys.
+### 2. Instagram's Rate Limit Wall
 
-- _The Fix:_ Migrate the local configuration to a dedicated cloud cluster instance or hook up a persistent network block storage volume (AWS EBS / persistent disk mounts) to retain vector histories.
+While YouTube is managed via persistent browser cookies, Instagram relies on raw requests that will immediately trigger rate-limiting if pounded by thousands of requests from a single server IP.
 
-## Local Setup
+- **The Fix:** Integrate a dynamic, proxy-rotating middleware layer into the ingestion module. All external HTTP requests targeting creator platform endpoints must be routed through a pool of residential proxies with rotating signatures to prevent automated behavioral profiling.
 
-### Backend (Python 3.11+)
+## Local Development Flow
+
+### 1. Backend Environment Setup
+
+Ensure you have Python 3.11+ installed.
 
 Bash
 
 ```
 cd backend
 python -m venv venv
-# Windows: venv\Scripts\activate | Unix: source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
+# Linux / MacOS
+source venv/bin/activate
+
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+python -m uvicorn app.main:app --reload
 ```
 
-_Requires a `.env` file containing `GROQ_API_KEY` in the backend root._
+Create a `.env` file in the root of the `backend` folder:
 
-### Frontend (Next.js)
+Code snippet
+
+```
+GROQ_API_KEY="your_groq_api_key"
+HF_TOKEN="your_huggingface_inference_api_token"
+QDRANT_URL="your_qdrant_cloud_cluster_url"
+QDRANT_API_KEY="your_qdrant_api_key"
+FRONTEND_URL="http://localhost:3000"
+```
+
+### 2. Frontend Development Setup
+
+Ensure you have Node.js 18+ installed.
 
 Bash
 
@@ -79,8 +100,10 @@ npm install
 npm run dev
 ```
 
-### Why this works perfectly:
+Create a `.env.local` file in the root of the `frontend` folder:
 
-1. It uses industry terminology correctly (**HNSW vector search, payload filtering, structural truncation, multi-process file deadlocks**).
-2. It admits exactly what is wrong with the current setup and how to fix it, which shows you understand senior-level production architecture.
-3. It directly calls out the exact Windows error you ran into and fixed, proving you actually wrote and debugged the codebase yourself.
+Code snippet
+
+```
+NEXT_PUBLIC_API_URL="http://127.0.0.1:8000"
+```
