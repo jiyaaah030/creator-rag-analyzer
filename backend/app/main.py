@@ -7,14 +7,20 @@ app = FastAPI()
 
 # Dynamically read the production frontend URL from environment variables.
 # Fall back to localhost for local testing.
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+origins = [
+    frontend_url,
+    "https://creator-rag-analyzer.vercel.app", 
+    "http://localhost:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000"], 
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows GET, POST, OPTIONS, PUT, DELETE, etc.
+    allow_headers=["*"],  # Allows all headers (Content-Type, Authorization, etc.)
 )
 
 app.include_router(video_router)
