@@ -1,7 +1,8 @@
-from langchain_huggingface import HuggingFaceEmbeddings
+# from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
@@ -16,9 +17,15 @@ load_dotenv()
 _client_instance = None
 COLLECTION_NAME = "youtube_rag"
 
-print("Loading HuggingFace embeddings...")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# print("Loading HuggingFace embeddings...")
+# embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
+print("Connecting to HuggingFace Inference API...")
+hf_token = os.getenv("HF_TOKEN")
+embeddings = HuggingFaceEndpointEmbeddings(
+    model="sentence-transformers/all-MiniLM-L6-v2",
+    huggingfacehub_api_token=hf_token,
+)
 
 def get_qdrant_client():
     """Lazily initializes the Qdrant client, preferring cloud credentials if available."""
