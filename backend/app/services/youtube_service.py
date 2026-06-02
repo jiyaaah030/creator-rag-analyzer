@@ -1,6 +1,9 @@
 from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
 import re
+import os
+
+cookie_path = os.path.join(os.getcwd(), "youtube_cookies.txt")
 
 def extract_video_id(url: str):
     pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
@@ -27,8 +30,10 @@ def get_youtube_data(url: str):
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
-            "extract_flat": False, # We need the full metadata payload
-            "cookiefile": "youtube_cookies.txt"  # <--- ADD THIS LINE
+            "extract_flat": False, 
+            "cookiefile": cookie_path,
+            "ignore_no_formats_error": True, # Don't crash if formats are weird
+            "format": "best"                 # Just grab whatever default format is available
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
